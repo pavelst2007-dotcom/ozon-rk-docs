@@ -190,6 +190,72 @@ curl -H "Authorization: Bearer <ваш-токен>" \
 
 ---
 
+### 4.4. `POST /clients/:client_id/parser-prices/batch` — передать цены парсера
+
+Внешний сервис-парсер передаёт актуальные цены (с картой / без карты) для товаров конкретного клиента. Данные записываются в `parser_prices` и `parser_prices_history`.
+
+> Используйте этот эндпоинт вместо прямого доступа к БД. Каждый клиент передаёт данные **только по своим SKU** — попытка передать чужой SKU молча игнорируется (попадает в `skipped_skus`).
+
+**Запрос:**
+```bash
+curl -X POST \
+  -H "Authorization: Bearer <ваш-токен>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "items": [
+      { "sku": "4290879045", "price_card": 2242.0, "price_regular": 2478.0, "parsed_at": "2026-05-29T13:35:00Z" },
+      { "sku": "3548174906", "price_card": 2242.0, "price_regular": 2470.0, "parsed_at": "2026-05-29T13:35:00Z" }
+    ]
+  }' \
+  https://<ваш-домен>/api/v1/clients/8f3a1c9d2e4b4a8b9c0d1e2f3a4b5c6d/parser-prices/batch
+```
+
+**Тело запроса (`items[]`):**
+| Поле | Тип | Обязательное | Описание |
+|---|---|---|---|
+| `sku` | string | ✅ | SKU Ozon |
+| `price_card` | number\|null | ✅ | Цена с картой Ozon (₽) |
+| `price_regular` | number\|null | ✅ | Цена без карты (₽) |
+| `parsed_at` | string (ISO 8601) | ❌ | Время парсинга; если не передано — используется текущее время сервера |
+
+**Ограничения:**
+- Максимум **500 элементов** в одном запросе. При превышении сервер вернёт `400 bad_request`.
+- Оба поля `price_card` и `price_regular` могут быть `null` — например, если товар временно недоступен.
+
+**Ответ `200 OK`:**
+```json
+{
+  "ok": true,
+  "accepted": 2,
+  "skipped": 0,
+  "skipped_skus": []
+}
+```
+
+**Поля ответа:**
+| Поле | Тип | Описание |
+|---|---|---|
+| `accepted` | number | Количество SKU успешно записанных в БД |
+| `skipped` | number | Количество SKU проигнорированных (не принадлежат клиенту) |
+| `skipped_skus` | string[] | Список проигнорированных SKU (для отладки) |
+
+**Пример с частичным пропуском:**
+```json
+{
+  "ok": true,
+  "accepted": 1,
+  "skipped": 1,
+  "skipped_skus": ["9999999999"]
+}
+```
+
+**Логика записи в историю:**
+Запись в `parser_prices_history` создаётся если:
+- цена изменилась относительно предыдущей записи, **или**
+- прошло более 23 часов с последней записи (ежедневный чекпоинт).
+
+---
+
 ## 5. Коды ошибок
 
 Все ошибки возвращают JSON формата:
@@ -199,7 +265,8 @@ curl -H "Authorization: Bearer <ваш-токен>" \
 
 | HTTP | `error` | Когда |
 |---|---|---|
-| `400` | `bad_request` | некорректные параметры (например, нет `public_id`) |
+| `400` | `bad_request` | некорректные параметры или превышен лимит 500 items |
+| `400` | `invalid_items` | поле `items` отсутствует или не является массивом |
 | `401` | `unauthorized` | отсутствует заголовок `Authorization` |
 | `401` | `invalid_token` | токен передан, но не совпадает |
 | `404` | `client_not_found` | клиент с таким `public_id` не существует |
@@ -232,6 +299,19 @@ async function getTrackedProducts(clientId) {
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return r.json();
 }
+
+async function pushParserPrices(clientId, items) {
+  const r = await fetch(`${BASE}/clients/${clientId}/parser-prices/batch`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ items }),
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+  return r.json(); // { ok, accepted, skipped, skipped_skus }
+}
 ```
 
 ### Python (requests)
@@ -251,6 +331,16 @@ def get_tracked(client_id: str):
     r = requests.get(f'{BASE}/clients/{client_id}/tracked', headers=HEADERS, timeout=10)
     r.raise_for_status()
     return r.json()
+
+def push_parser_prices(client_id: str, items: list):
+    r = requests.post(
+        f'{BASE}/clients/{client_id}/parser-prices/batch',
+        headers={**HEADERS, 'Content-Type': 'application/json'},
+        json={'items': items},
+        timeout=30
+    )
+    r.raise_for_status()
+    return r.json()  # { ok, accepted, skipped, skipped_skus }
 ```
 
 ### PHP
@@ -267,6 +357,24 @@ curl_setopt_array($ch, [
 $response = curl_exec($ch);
 curl_close($ch);
 $data = json_decode($response, true);
+
+// Передать цены парсера
+function pushParserPrices(string $clientId, array $items): array {
+    global $base, $token;
+    $ch = curl_init("$base/clients/$clientId/parser-prices/batch");
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => json_encode(['items' => $items]),
+        CURLOPT_HTTPHEADER     => [
+            "Authorization: Bearer $token",
+            "Content-Type: application/json",
+        ],
+    ]);
+    $response = curl_exec($ch);
+    curl_close($ch);
+    return json_decode($response, true);
+}
 ```
 
 ---
@@ -279,16 +387,17 @@ $data = json_decode($response, true);
 4. **Храните токен в переменных окружения**, никогда не коммитьте его в репозиторий.
 5. **При HTTP 429** ждите время из `Retry-After` и повторяйте запрос.
 6. **При HTTP 401** не пытайтесь повторить — токен либо отозван, либо перевыпущен. Свяжитесь с администратором.
+7. **Для `parser-prices/batch`** отправляйте все SKU клиента одним запросом — это эффективнее и не нагружает rate limit.
 
 ---
 
 ## 8. Что планируется в следующих версиях
 
-- POST/PUT/DELETE эндпоинты для управления отслеживанием со стороны интегратора
 - Webhook-уведомления о новых товарах и изменениях цен
 - Доступ к истории цен (`GET /clients/:id/tracked/:product_id/price-history`)
 - Per-client токены (вместо глобального)
 - OpenAPI 3.0 спецификация + Swagger UI
+- `DELETE /clients/:id/parser-prices/batch` — удаление устаревших данных парсера
 
 Если нужна функциональность из этого списка — напишите администратору.
 
